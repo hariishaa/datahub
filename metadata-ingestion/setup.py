@@ -1,4 +1,3 @@
-import os
 import sys
 from typing import Dict, Set
 
@@ -9,18 +8,9 @@ with open("./src/datahub/__init__.py") as fp:
     exec(fp.read(), package_metadata)
 
 
-def get_long_description():
-    root = os.path.dirname(__file__)
-    with open(os.path.join(root, "README.md")) as f:
-        description = f.read()
-
-    return description
-
-
 base_requirements = {
-    # Typing extension should be >=3.10.0.2 ideally but we can't restrict due to Airflow 2.0.2 dependency conflict
-    "typing_extensions>=3.7.4.3 ;  python_version < '3.8'",
-    "typing_extensions>=3.10.0.2,<4.6.0 ;  python_version >= '3.8'",
+    # Typing extension should be >=3.10.0.2 ideally but we can't restrict due to a Airflow 2.1 dependency conflict.
+    "typing_extensions>=3.7.4.3",
     "mypy_extensions>=0.4.3",
     # Actual dependencies.
     "typing-inspect",
@@ -36,18 +26,18 @@ framework_common = {
     "click-default-group",
     "PyYAML",
     "toml>=0.10.0",
-    "entrypoints",
+    # In Python 3.10+, importlib_metadata is included in the standard library.
+    "importlib_metadata>=4.0.0; python_version < '3.10'",
     "docker",
     "expandvars>=0.6.5",
-    "avro-gen3==0.7.10",
+    "avro-gen3==0.7.11",
     # "avro-gen3 @ git+https://github.com/acryldata/avro_gen@master#egg=avro-gen3",
-    "avro>=1.10.2,<1.11",
+    "avro>=1.11.3,<1.12",
     "python-dateutil>=2.8.0",
     "tabulate",
     "progressbar2",
     "termcolor>=1.0.0",
     "psutil>=5.8.0",
-    "ratelimiter",
     "Deprecated",
     "humanfriendly",
     "packaging",
@@ -111,21 +101,35 @@ kafka_protobuf = {
     "grpcio-tools>=1.44.0,<2",
 }
 
-sql_common = {
-    # Required for all SQL sources.
-    # This is temporary lower bound that we're open to loosening/tightening as requirements show up
-    "sqlalchemy>=1.4.39, <2",
-    # Required for SQL profiling.
-    "great-expectations>=0.15.12, <=0.15.50",
-    # scipy version restricted to reduce backtracking, used by great-expectations,
-    "scipy>=1.7.2",
-    # GE added handling for higher version of jinja2
-    # https://github.com/great-expectations/great_expectations/pull/5382/files
-    # datahub does not depend on traitlets directly but great expectations does.
-    # https://github.com/ipython/traitlets/issues/741
-    "traitlets<5.2.2",
-    "greenlet",
+usage_common = {
+    "sqlparse",
 }
+
+sqlglot_lib = {
+    # Using an Acryl fork of sqlglot.
+    # https://github.com/tobymao/sqlglot/compare/main...hsheth2:sqlglot:hsheth?expand=1
+    "acryl-sqlglot==19.0.2.dev10",
+}
+
+sql_common = (
+    {
+        # Required for all SQL sources.
+        # This is temporary lower bound that we're open to loosening/tightening as requirements show up
+        "sqlalchemy>=1.4.39, <2",
+        # Required for SQL profiling.
+        "great-expectations>=0.15.12, <=0.15.50",
+        # scipy version restricted to reduce backtracking, used by great-expectations,
+        "scipy>=1.7.2",
+        # GE added handling for higher version of jinja2
+        # https://github.com/great-expectations/great_expectations/pull/5382/files
+        # datahub does not depend on traitlets directly but great expectations does.
+        # https://github.com/ipython/traitlets/issues/741
+        "traitlets<5.2.2",
+        "greenlet",
+    }
+    | usage_common
+    | sqlglot_lib
+)
 
 sqllineage_lib = {
     "sqllineage==1.3.8",
@@ -133,12 +137,6 @@ sqllineage_lib = {
     # There have previously been issues from not pinning sqlparse, so it's best to pin it.
     # Related: https://github.com/reata/sqllineage/issues/361 and https://github.com/reata/sqllineage/pull/360
     "sqlparse==0.4.4",
-}
-
-sqlglot_lib = {
-    # Using an Acryl fork of sqlglot.
-    # https://github.com/tobymao/sqlglot/compare/main...hsheth2:sqlglot:hsheth?expand=1
-    "acryl-sqlglot==18.5.2.dev45",
 }
 
 aws_common = {
@@ -175,7 +173,9 @@ bigquery_common = {
 
 clickhouse_common = {
     # Clickhouse 0.2.0 adds support for SQLAlchemy 1.4.x
-    "clickhouse-sqlalchemy>=0.2.0",
+    # Disallow 0.2.5 because of https://github.com/xzkostyan/clickhouse-sqlalchemy/issues/272.
+    # Note that there's also a known issue around nested map types: https://github.com/xzkostyan/clickhouse-sqlalchemy/issues/269.
+    "clickhouse-sqlalchemy>=0.2.0,<0.2.5",
 }
 
 redshift_common = {
@@ -242,7 +242,7 @@ s3_base = {
 }
 
 data_lake_profiling = {
-    "pydeequ==1.1.0",
+    "pydeequ~=1.1.0",
     "pyspark~=3.3.0",
 }
 
@@ -253,14 +253,10 @@ delta_lake = {
 
 powerbi_report_server = {"requests", "requests_ntlm"}
 
-usage_common = {
-    "sqlparse",
-}
-
 databricks = {
     # 0.1.11 appears to have authentication issues with azure databricks
-    "databricks-sdk>=0.1.1, <0.1.11",
-    "pyspark",
+    "databricks-sdk>=0.9.0",
+    "pyspark~=3.3.0",
     "requests",
 }
 
@@ -271,6 +267,7 @@ plugins: Dict[str, Set[str]] = {
     # Sink plugins.
     "datahub-kafka": kafka_common,
     "datahub-rest": rest_common,
+    "sync-file-emitter": {"filelock"},
     "datahub-lite": {
         "duckdb",
         "fastapi",
@@ -289,8 +286,10 @@ plugins: Dict[str, Set[str]] = {
     # Misc plugins.
     "sql-parser": sqlglot_lib,
     # Source plugins
-    # PyAthena is pinned with exact version because we use private method in PyAthena
-    "athena": sql_common | {"PyAthena[SQLAlchemy]==2.4.1"},
+    # sqlalchemy-bigquery is included here since it provides an implementation of
+    # a SQLalchemy-conform STRUCT type definition
+    "athena": sql_common
+    | {"PyAthena[SQLAlchemy]>=2.6.0,<3.0.0", "sqlalchemy-bigquery>=1.4.1"},
     "azure-ad": set(),
     "bigquery": sql_common
     | bigquery_common
@@ -362,9 +361,13 @@ plugins: Dict[str, Set[str]] = {
     | {"psycopg2-binary", "pymysql>=1.0.2"},
     "pulsar": {"requests"},
     "redash": {"redash-toolbelt", "sql-metadata"} | sqllineage_lib,
-    "redshift": sql_common | redshift_common | usage_common | {"redshift-connector"},
-    "redshift-legacy": sql_common | redshift_common,
-    "redshift-usage-legacy": sql_common | usage_common | redshift_common,
+    "redshift": sql_common
+    | redshift_common
+    | usage_common
+    | {"redshift-connector"}
+    | sqlglot_lib,
+    "redshift-legacy": sql_common | redshift_common | sqlglot_lib,
+    "redshift-usage-legacy": sql_common | redshift_common | sqlglot_lib | usage_common,
     "s3": {*s3_base, *data_lake_profiling},
     "gcs": {*s3_base, *data_lake_profiling},
     "sagemaker": aws_common,
@@ -381,13 +384,18 @@ plugins: Dict[str, Set[str]] = {
     # FIXME: I don't think tableau uses sqllineage anymore so we should be able
     # to remove that dependency.
     "tableau": {"tableauserverclient>=0.17.0"} | sqllineage_lib | sqlglot_lib,
+    "teradata": sql_common
+    | usage_common
+    | sqlglot_lib
+    | {"teradatasqlalchemy>=17.20.0.0"},
     "trino": sql_common | trino,
     "starburst-trino-usage": sql_common | usage_common | trino,
     "nifi": {"requests", "packaging", "requests-gssapi"},
     "powerbi": microsoft_common | {"lark[regex]==1.1.4", "sqlparse"} | sqlglot_lib,
     "powerbi-report-server": powerbi_report_server,
-    "vertica": sql_common | {"vertica-sqlalchemy-dialect[vertica-python]==0.0.8"},
+    "vertica": sql_common | {"vertica-sqlalchemy-dialect[vertica-python]==0.0.8.1"},
     "unity-catalog": databricks | sqllineage_lib,
+    "fivetran": snowflake_common,
 }
 
 # This is mainly used to exclude plugins from the Docker image.
@@ -405,7 +413,12 @@ mypy_stubs = {
     "types-pkg_resources",
     "types-six",
     "types-python-dateutil",
-    "types-requests>=2.28.11.6",
+    # We need to avoid 2.31.0.5 and 2.31.0.4 due to
+    # https://github.com/python/typeshed/issues/10764. Once that
+    # issue is resolved, we can remove the upper bound and change it
+    # to a != constraint.
+    # We have a PR up to fix the underlying issue: https://github.com/python/typeshed/pull/10776.
+    "types-requests>=2.28.11.6,<=2.31.0.3",
     "types-toml",
     "types-PyMySQL",
     "types-PyYAML",
@@ -426,7 +439,6 @@ mypy_stubs = {
     "types-termcolor>=1.0.0",
     "types-Deprecated",
     "types-protobuf>=4.21.0.1",
-    "types-tzlocal",
     "sqlalchemy2-stubs",
 }
 
@@ -434,6 +446,10 @@ mypy_stubs = {
 pytest_dep = "pytest>=6.2.2"
 deepdiff_dep = "deepdiff"
 test_api_requirements = {pytest_dep, deepdiff_dep, "PyYAML"}
+
+debug_requirements = {
+    "memray",
+}
 
 base_dev_requirements = {
     *base_requirements,
@@ -467,6 +483,7 @@ base_dev_requirements = {
     *list(
         dependency
         for plugin in [
+            "athena",
             "bigquery",
             "clickhouse",
             "clickhouse-usage",
@@ -489,6 +506,7 @@ base_dev_requirements = {
             "kafka",
             "datahub-rest",
             "datahub-lite",
+            "great-expectations",
             "presto",
             "redash",
             "redshift",
@@ -497,6 +515,7 @@ base_dev_requirements = {
             "s3",
             "snowflake",
             "tableau",
+            "teradata",
             "trino",
             "hive",
             "starburst-trino-usage",
@@ -507,6 +526,8 @@ base_dev_requirements = {
             "nifi",
             "vertica",
             "mode",
+            "fivetran",
+            "kafka-connect",
         ]
         if plugin
         for dependency in plugins[plugin]
@@ -526,6 +547,7 @@ full_test_dev_requirements = {
             "clickhouse",
             "delta-lake",
             "druid",
+            "feast" if sys.version_info >= (3, 8) else None,
             "hana",
             "hive",
             "iceberg" if sys.version_info >= (3, 8) else None,
@@ -593,6 +615,7 @@ entry_points = {
         "tableau = datahub.ingestion.source.tableau:TableauSource",
         "openapi = datahub.ingestion.source.openapi:OpenApiSource",
         "metabase = datahub.ingestion.source.metabase:MetabaseSource",
+        "teradata = datahub.ingestion.source.sql.teradata:TeradataSource",
         "trino = datahub.ingestion.source.sql.trino:TrinoSource",
         "starburst-trino-usage = datahub.ingestion.source.usage.starburst_trino_usage:TrinoUsageSource",
         "nifi = datahub.ingestion.source.nifi:NifiSource",
@@ -608,6 +631,7 @@ entry_points = {
         "unity-catalog = datahub.ingestion.source.unity.source:UnityCatalogSource",
         "gcs = datahub.ingestion.source.gcs.gcs_source:GCSSource",
         "sql-queries = datahub.ingestion.source.sql_queries:SqlQueriesSource",
+        "fivetran = datahub.ingestion.source.fivetran.fivetran:FivetranSource",
     ],
     "datahub.ingestion.transformer.plugins": [
         "simple_remove_dataset_ownership = datahub.ingestion.transformer.remove_dataset_ownership:SimpleRemoveDatasetOwnership",
@@ -630,6 +654,7 @@ entry_points = {
         "simple_add_dataset_properties = datahub.ingestion.transformer.add_dataset_properties:SimpleAddDatasetProperties",
         "pattern_add_dataset_schema_terms = datahub.ingestion.transformer.add_dataset_schema_terms:PatternAddDatasetSchemaTerms",
         "pattern_add_dataset_schema_tags = datahub.ingestion.transformer.add_dataset_schema_tags:PatternAddDatasetSchemaTags",
+        "extract_owners_from_tags = datahub.ingestion.transformer.extract_ownership_from_tags:ExtractOwnersFromTagsTransformer",
     ],
     "datahub.ingestion.sink.plugins": [
         "file = datahub.ingestion.sink.file:FileSink",
@@ -641,11 +666,13 @@ entry_points = {
     ],
     "datahub.ingestion.checkpointing_provider.plugins": [
         "datahub = datahub.ingestion.source.state_provider.datahub_ingestion_checkpointing_provider:DatahubIngestionCheckpointingProvider",
+        "file = datahub.ingestion.source.state_provider.file_ingestion_checkpointing_provider:FileIngestionCheckpointingProvider",
     ],
     "datahub.ingestion.reporting_provider.plugins": [
         "datahub = datahub.ingestion.reporting.datahub_ingestion_run_summary_provider:DatahubIngestionRunSummaryProvider",
         "file = datahub.ingestion.reporting.file_reporter:FileReporter",
     ],
+    "datahub.custom_packages": [],
 }
 
 
@@ -658,10 +685,16 @@ setuptools.setup(
         "Documentation": "https://datahubproject.io/docs/",
         "Source": "https://github.com/datahub-project/datahub",
         "Changelog": "https://github.com/datahub-project/datahub/releases",
+        "Releases": "https://github.com/acryldata/datahub/releases",
     },
     license="Apache License 2.0",
     description="A CLI to work with DataHub metadata",
-    long_description=get_long_description(),
+    long_description="""\
+The `acryl-datahub` package contains a CLI and SDK for interacting with DataHub,
+as well as an integration framework for pulling/pushing metadata from external systems.
+
+See the [DataHub docs](https://datahubproject.io/docs/metadata-ingestion).
+""",
     long_description_content_type="text/markdown",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
@@ -712,8 +745,10 @@ setuptools.setup(
                 ]
             )
         ),
+        "cloud": ["acryl-datahub-cloud"],
         "dev": list(dev_requirements),
         "testing-utils": list(test_api_requirements),  # To import `datahub.testing`
         "integration-tests": list(full_test_dev_requirements),
+        "debug": list(debug_requirements),
     },
 )

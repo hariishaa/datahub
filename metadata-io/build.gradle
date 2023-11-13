@@ -8,9 +8,9 @@ configurations {
 dependencies {
   implementation project(':entity-registry')
   api project(':metadata-utils')
-  api project(':metadata-events:mxe-avro-1.7')
+  api project(':metadata-events:mxe-avro')
   api project(':metadata-events:mxe-registration')
-  api project(':metadata-events:mxe-utils-avro-1.7')
+  api project(':metadata-events:mxe-utils-avro')
   api project(':metadata-models')
   api project(':metadata-service:restli-client')
   api project(':metadata-service:configuration')
@@ -57,6 +57,9 @@ dependencies {
   testImplementation externalDependency.h2
   testImplementation externalDependency.mysqlConnector
   testImplementation externalDependency.neo4jHarness
+  testImplementation (externalDependency.neo4jApoc) {
+    exclude group: 'org.yaml', module: 'snakeyaml'
+  }
   testImplementation externalDependency.mockito
   testImplementation externalDependency.mockitoInline
   testImplementation externalDependency.iStackCommons
