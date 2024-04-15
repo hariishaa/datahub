@@ -1,6 +1,7 @@
 import copy
 import functools
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, TypeVar, cast
 
@@ -8,21 +9,24 @@ import airflow
 import datahub.emitter.mce_builder as builder
 from datahub.api.entities.datajob import DataJob
 from datahub.api.entities.dataprocess.dataprocess_instance import InstanceRunResult
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.emitter.rest_emitter import DatahubRestEmitter
 from datahub.ingestion.graph.client import DataHubGraph
 from datahub.metadata.schema_classes import (
     FineGrainedLineageClass,
     FineGrainedLineageDownstreamTypeClass,
     FineGrainedLineageUpstreamTypeClass,
+    StatusClass,
 )
+from datahub.sql_parsing.sqlglot_lineage import SqlParsingResult
 from datahub.telemetry import telemetry
-from datahub.utilities.sqlglot_lineage import SqlParsingResult
 from openlineage.airflow.listener import TaskHolder
 from openlineage.airflow.utils import redact_with_exclusions
 from openlineage.client.serde import Serde
 
 from datahub_airflow_plugin._airflow_shims import (
     HAS_AIRFLOW_DAG_LISTENER_API,
+    HAS_AIRFLOW_DATASET_LISTENER_API,
     Operator,
     get_task_inlets,
     get_task_outlets,
@@ -39,6 +43,7 @@ from datahub_airflow_plugin.entities import (
 
 _F = TypeVar("_F", bound=Callable[..., None])
 if TYPE_CHECKING:
+    from airflow.datasets import Dataset
     from airflow.models import DAG, DagRun, TaskInstance
     from sqlalchemy.orm import Session
 
@@ -55,7 +60,10 @@ logger = logging.getLogger(__name__)
 
 _airflow_listener_initialized = False
 _airflow_listener: Optional["DataHubListener"] = None
-_RUN_IN_THREAD = True
+_RUN_IN_THREAD = os.getenv("DATAHUB_AIRFLOW_PLUGIN_RUN_IN_THREAD", "true").lower() in (
+    "true",
+    "1",
+)
 _RUN_IN_THREAD_TIMEOUT = 30
 
 
@@ -72,12 +80,6 @@ def get_airflow_plugin_listener() -> Optional["DataHubListener"]:
         if plugin_config.enabled:
             _airflow_listener = DataHubListener(config=plugin_config)
 
-            if plugin_config.disable_openlineage_plugin:
-                # Deactivate the OpenLineagePlugin listener to avoid conflicts.
-                from openlineage.airflow.plugin import OpenLineagePlugin
-
-                OpenLineagePlugin.listeners = []
-
             telemetry.telemetry_instance.ping(
                 "airflow-plugin-init",
                 {
@@ -91,6 +93,13 @@ def get_airflow_plugin_listener() -> Optional["DataHubListener"]:
                     "disable_openlineage_plugin": plugin_config.disable_openlineage_plugin,
                 },
             )
+
+        if plugin_config.disable_openlineage_plugin:
+            # Deactivate the OpenLineagePlugin listener to avoid conflicts/errors.
+            from openlineage.airflow.plugin import OpenLineagePlugin
+
+            OpenLineagePlugin.listeners = []
+
     return _airflow_listener
 
 
@@ -119,7 +128,7 @@ def run_in_thread(f: _F) -> _F:
             else:
                 f(*args, **kwargs)
         except Exception as e:
-            logger.exception(e)
+            logger.warning(e, exc_info=True)
 
     return cast(_F, wrapper)
 
@@ -133,7 +142,7 @@ class DataHubListener:
 
         self._emitter = config.make_emitter_hook().make_emitter()
         self._graph: Optional[DataHubGraph] = None
-        logger.info(f"DataHub plugin using {repr(self._emitter)}")
+        logger.info(f"DataHub plugin v2 using {repr(self._emitter)}")
 
         # See discussion here https://github.com/OpenLineage/OpenLineage/pull/508 for
         # why we need to keep track of tasks ourselves.
@@ -292,6 +301,7 @@ class DataHubListener:
             logger.debug("Merging start datajob into finish datajob")
             datajob.inlets.extend(original_datajob.inlets)
             datajob.outlets.extend(original_datajob.outlets)
+            datajob.upstream_urns.extend(original_datajob.upstream_urns)
             datajob.fine_grained_lineages.extend(original_datajob.fine_grained_lineages)
 
             for k, v in original_datajob.properties.items():
@@ -300,6 +310,9 @@ class DataHubListener:
         # Deduplicate inlets/outlets.
         datajob.inlets = list(sorted(set(datajob.inlets), key=lambda x: str(x)))
         datajob.outlets = list(sorted(set(datajob.outlets), key=lambda x: str(x)))
+        datajob.upstream_urns = list(
+            sorted(set(datajob.upstream_urns), key=lambda x: str(x))
+        )
 
         # Write all other OL facets as DataHub properties.
         if task_metadata:
@@ -366,6 +379,7 @@ class DataHubListener:
             dag=dag,
             capture_tags=self.config.capture_tags_info,
             capture_owner=self.config.capture_ownership_info,
+            config=self.config,
         )
 
         # TODO: Make use of get_task_location to extract github urls.
@@ -387,6 +401,7 @@ class DataHubListener:
                 dag_run=dagrun,
                 datajob=datajob,
                 emit_templates=False,
+                config=self.config,
             )
             logger.debug(f"Emitted DataHub DataProcess Instance start: {dpi}")
 
@@ -409,6 +424,7 @@ class DataHubListener:
             dag=dag,
             capture_tags=self.config.capture_tags_info,
             capture_owner=self.config.capture_ownership_info,
+            config=self.config,
         )
 
         # Add lineage info.
@@ -426,6 +442,7 @@ class DataHubListener:
                 dag_run=dagrun,
                 datajob=datajob,
                 result=status,
+                config=self.config,
             )
             logger.debug(
                 f"Emitted DataHub DataProcess Instance with status {status}: {dpi}"
@@ -478,6 +495,16 @@ class DataHubListener:
         )
         dataflow.emit(self.emitter, callback=self._make_emit_callback())
 
+        # emit tags
+        for tag in dataflow.tags:
+            tag_urn = builder.make_tag_urn(tag)
+
+            event: MetadataChangeProposalWrapper = MetadataChangeProposalWrapper(
+                entityUrn=tag_urn, aspect=StatusClass(removed=False)
+            )
+
+            self.emitter.emit(event)
+
     if HAS_AIRFLOW_DAG_LISTENER_API:
 
         @hookimpl
@@ -494,3 +521,23 @@ class DataHubListener:
             self.emitter.flush()
 
     # TODO: Add hooks for on_dag_run_success, on_dag_run_failed -> call AirflowGenerator.complete_dataflow
+
+    if HAS_AIRFLOW_DATASET_LISTENER_API:
+
+        @hookimpl
+        @run_in_thread
+        def on_dataset_created(self, dataset: "Dataset") -> None:
+            self._set_log_level()
+
+            logger.debug(
+                f"DataHub listener got notification about dataset create for {dataset}"
+            )
+
+        @hookimpl
+        @run_in_thread
+        def on_dataset_changed(self, dataset: "Dataset") -> None:
+            self._set_log_level()
+
+            logger.debug(
+                f"DataHub listener got notification about dataset change for {dataset}"
+            )

@@ -27,6 +27,7 @@ from typing import (
 
 import sqlalchemy as sa
 import sqlalchemy.sql.compiler
+from great_expectations.core.profiler_types_mapping import ProfilerTypeMapping
 from great_expectations.core.util import convert_to_json_serializable
 from great_expectations.data_context import AbstractDataContext, BaseDataContext
 from great_expectations.data_context.types.base import (
@@ -44,13 +45,16 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import ProgrammingError
 from typing_extensions import Concatenate, ParamSpec
 
+from datahub.emitter import mce_builder
 from datahub.emitter.mce_builder import get_sys_time
+from datahub.ingestion.graph.client import get_default_graph
 from datahub.ingestion.source.ge_profiling_config import GEProfilingConfig
 from datahub.ingestion.source.profiling.common import (
     Cardinality,
     convert_to_cardinality,
 )
 from datahub.ingestion.source.sql.sql_common import SQLSourceReport
+from datahub.metadata.com.linkedin.pegasus2avro.schema import EditableSchemaMetadata
 from datahub.metadata.schema_classes import (
     DatasetFieldProfileClass,
     DatasetProfileClass,
@@ -77,7 +81,25 @@ MYSQL = "mysql"
 SNOWFLAKE = "snowflake"
 BIGQUERY = "bigquery"
 REDSHIFT = "redshift"
+DATABRICKS = "databricks"
 TRINO = "trino"
+
+# Type names for Databricks, to match Title Case types in sqlalchemy
+ProfilerTypeMapping.INT_TYPE_NAMES.append("Integer")
+ProfilerTypeMapping.INT_TYPE_NAMES.append("SmallInteger")
+ProfilerTypeMapping.INT_TYPE_NAMES.append("BigInteger")
+ProfilerTypeMapping.FLOAT_TYPE_NAMES.append("Float")
+ProfilerTypeMapping.FLOAT_TYPE_NAMES.append("Numeric")
+ProfilerTypeMapping.STRING_TYPE_NAMES.append("String")
+ProfilerTypeMapping.STRING_TYPE_NAMES.append("Text")
+ProfilerTypeMapping.STRING_TYPE_NAMES.append("Unicode")
+ProfilerTypeMapping.STRING_TYPE_NAMES.append("UnicodeText")
+ProfilerTypeMapping.BOOLEAN_TYPE_NAMES.append("Boolean")
+ProfilerTypeMapping.DATETIME_TYPE_NAMES.append("Date")
+ProfilerTypeMapping.DATETIME_TYPE_NAMES.append("DateTime")
+ProfilerTypeMapping.DATETIME_TYPE_NAMES.append("Time")
+ProfilerTypeMapping.DATETIME_TYPE_NAMES.append("Interval")
+ProfilerTypeMapping.BINARY_TYPE_NAMES.append("LargeBinary")
 
 # The reason for this wacky structure is quite fun. GE basically assumes that
 # the config structures were generated directly from YML and further assumes that
@@ -277,6 +299,9 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
 
     query_combiner: SQLAlchemyQueryCombiner
 
+    platform: str
+    env: str
+
     def _get_columns_to_profile(self) -> List[str]:
         if not self.config.any_field_level_metrics_enabled():
             return []
@@ -400,7 +425,22 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
                 self.dataset.engine.execute(get_estimate_script).scalar()
             )
         else:
-            dataset_profile.rowCount = self.dataset.get_row_count()
+            # If the configuration is not set to 'estimate only' mode, we directly obtain the row count from the dataset.
+            # However, if an offset or limit is set, we need to adjust how we calculate the row count.
+            # This is because applying a limit or offset could potentially skew the row count.
+            # For instance, if a limit is set and the actual row count exceeds this limit,
+            # the returned row count would incorrectly be the limit value.
+            #
+            # To address this, if a limit is set, we use the original table name when calculating the row count.
+            # This ensures that the row count is based on the original table, not on a view which have limit or offset applied.
+            if (self.config.limit or self.config.offset) and not self.custom_sql:
+                # We don't want limit and offset to get applied to the row count
+                # This is kinda hacky way to do it, but every other way would require major refactoring
+                dataset_profile.rowCount = self.dataset.get_row_count(
+                    self.dataset_name.split(".")[-1]
+                )
+            else:
+                dataset_profile.rowCount = self.dataset.get_row_count()
 
     @_run_with_query_combiner
     def _get_dataset_column_min(
@@ -636,6 +676,16 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
         profile.columnCount = len(all_columns)
         columns_to_profile = set(self._get_columns_to_profile())
 
+        (
+            ignore_table_sampling,
+            columns_list_to_ignore_sampling,
+        ) = _get_columns_to_ignore_sampling(
+            self.dataset_name,
+            self.config.tags_to_ignore_sampling,
+            self.platform,
+            self.env,
+        )
+
         logger.debug(f"profiling {self.dataset_name}: flushing stage 1 queries")
         self.query_combiner.flush()
 
@@ -661,14 +711,12 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
         assert profile.rowCount is not None
         row_count: int  # used for null counts calculation
         if profile.partitionSpec and "SAMPLE" in profile.partitionSpec.partition:
-            # We can alternatively use `self._get_dataset_rows(profile)` to get
-            # exact count of rows in sample, as actual rows involved in sample
-            # may be slightly different (more or less) than configured `sample_size`.
-            # However not doing so to start with, as that adds another query overhead
-            # plus approximate metrics should work for sampling based profiling.
-            row_count = self.config.sample_size
-        else:
-            row_count = profile.rowCount
+            # Querying exact row count of sample using `_get_dataset_rows`.
+            # We are not using `self.config.sample_size` directly as actual row count
+            # in sample may be slightly different (more or less) than configured `sample_size`.
+            self._get_dataset_rows(profile)
+
+        row_count = profile.rowCount
 
         for column_spec in columns_profiling_queue:
             column = column_spec.column
@@ -697,76 +745,83 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
                             1, unique_count / non_null_count
                         )
 
-            self._get_dataset_column_sample_values(column_profile, column)
+            if not profile.rowCount:
+                continue
 
             if (
-                type_ == ProfilerDataType.INT
-                or type_ == ProfilerDataType.FLOAT
-                or type_ == ProfilerDataType.NUMERIC
+                not ignore_table_sampling
+                and column not in columns_list_to_ignore_sampling
             ):
-                self._get_dataset_column_min(column_profile, column)
-                self._get_dataset_column_max(column_profile, column)
-                self._get_dataset_column_mean(column_profile, column)
-                self._get_dataset_column_median(column_profile, column)
-                self._get_dataset_column_stdev(column_profile, column)
+                self._get_dataset_column_sample_values(column_profile, column)
 
-                if cardinality in [
-                    Cardinality.ONE,
-                    Cardinality.TWO,
-                    Cardinality.VERY_FEW,
-                ]:
-                    self._get_dataset_column_distinct_value_frequencies(
-                        column_profile,
-                        column,
-                    )
-                if cardinality in {
-                    Cardinality.FEW,
-                    Cardinality.MANY,
-                    Cardinality.VERY_MANY,
-                }:
-                    self._get_dataset_column_quantiles(column_profile, column)
-                    self._get_dataset_column_histogram(column_profile, column)
+                if (
+                    type_ == ProfilerDataType.INT
+                    or type_ == ProfilerDataType.FLOAT
+                    or type_ == ProfilerDataType.NUMERIC
+                ):
+                    self._get_dataset_column_min(column_profile, column)
+                    self._get_dataset_column_max(column_profile, column)
+                    self._get_dataset_column_mean(column_profile, column)
+                    self._get_dataset_column_median(column_profile, column)
+                    self._get_dataset_column_stdev(column_profile, column)
 
-            elif type_ == ProfilerDataType.STRING:
-                if cardinality in [
-                    Cardinality.ONE,
-                    Cardinality.TWO,
-                    Cardinality.VERY_FEW,
-                    Cardinality.FEW,
-                ]:
-                    self._get_dataset_column_distinct_value_frequencies(
-                        column_profile,
-                        column,
-                    )
+                    if cardinality in [
+                        Cardinality.ONE,
+                        Cardinality.TWO,
+                        Cardinality.VERY_FEW,
+                    ]:
+                        self._get_dataset_column_distinct_value_frequencies(
+                            column_profile,
+                            column,
+                        )
+                    if cardinality in {
+                        Cardinality.FEW,
+                        Cardinality.MANY,
+                        Cardinality.VERY_MANY,
+                    }:
+                        self._get_dataset_column_quantiles(column_profile, column)
+                        self._get_dataset_column_histogram(column_profile, column)
 
-            elif type_ == ProfilerDataType.DATETIME:
-                self._get_dataset_column_min(column_profile, column)
-                self._get_dataset_column_max(column_profile, column)
+                elif type_ == ProfilerDataType.STRING:
+                    if cardinality in [
+                        Cardinality.ONE,
+                        Cardinality.TWO,
+                        Cardinality.VERY_FEW,
+                        Cardinality.FEW,
+                    ]:
+                        self._get_dataset_column_distinct_value_frequencies(
+                            column_profile,
+                            column,
+                        )
 
-                # FIXME: Re-add histogram once kl_divergence has been modified to support datetimes
+                elif type_ == ProfilerDataType.DATETIME:
+                    self._get_dataset_column_min(column_profile, column)
+                    self._get_dataset_column_max(column_profile, column)
 
-                if cardinality in [
-                    Cardinality.ONE,
-                    Cardinality.TWO,
-                    Cardinality.VERY_FEW,
-                    Cardinality.FEW,
-                ]:
-                    self._get_dataset_column_distinct_value_frequencies(
-                        column_profile,
-                        column,
-                    )
+                    # FIXME: Re-add histogram once kl_divergence has been modified to support datetimes
 
-            else:
-                if cardinality in [
-                    Cardinality.ONE,
-                    Cardinality.TWO,
-                    Cardinality.VERY_FEW,
-                    Cardinality.FEW,
-                ]:
-                    self._get_dataset_column_distinct_value_frequencies(
-                        column_profile,
-                        column,
-                    )
+                    if cardinality in [
+                        Cardinality.ONE,
+                        Cardinality.TWO,
+                        Cardinality.VERY_FEW,
+                        Cardinality.FEW,
+                    ]:
+                        self._get_dataset_column_distinct_value_frequencies(
+                            column_profile,
+                            column,
+                        )
+
+                else:
+                    if cardinality in [
+                        Cardinality.ONE,
+                        Cardinality.TWO,
+                        Cardinality.VERY_FEW,
+                        Cardinality.FEW,
+                    ]:
+                        self._get_dataset_column_distinct_value_frequencies(
+                            column_profile,
+                            column,
+                        )
 
         logger.debug(f"profiling {self.dataset_name}: flushing stage 3 queries")
         self.query_combiner.flush()
@@ -861,6 +916,7 @@ class DatahubGEProfiler:
 
     base_engine: Engine
     platform: str  # passed from parent source config
+    env: str
 
     # The actual value doesn't matter, it just matters that we use it consistently throughout.
     _datasource_name_base: str = "my_sqlalchemy_datasource"
@@ -871,11 +927,14 @@ class DatahubGEProfiler:
         report: SQLSourceReport,
         config: GEProfilingConfig,
         platform: str,
+        env: str = "PROD",
     ):
         self.report = report
         self.config = config
         self.times_taken = []
         self.total_row_count = 0
+
+        self.env = env
 
         # TRICKY: The call to `.engine` is quite important here. Connection.connect()
         # returns a "branched" connection, which does not actually use a new underlying
@@ -1116,6 +1175,8 @@ class DatahubGEProfiler:
                     self.report,
                     custom_sql,
                     query_combiner,
+                    self.platform,
+                    self.env,
                 ).generate_dataset_profile()
 
                 time_taken = timer.elapsed_seconds()
@@ -1172,7 +1233,7 @@ class DatahubGEProfiler:
             },
         )
 
-        if platform == BIGQUERY:
+        if platform == BIGQUERY or platform == DATABRICKS:
             # This is done as GE makes the name as DATASET.TABLE
             # but we want it to be PROJECT.DATASET.TABLE instead for multi-project setups
             name_parts = pretty_name.split(".")
@@ -1261,12 +1322,57 @@ def create_bigquery_temp_table(
         # temporary table dance. However, that would require either a) upgrading to
         # use GE's batch v3 API or b) bypassing GE altogether.
 
-        query_job: Optional[
-            "google.cloud.bigquery.job.query.QueryJob"
-        ] = cursor._query_job
+        query_job: Optional["google.cloud.bigquery.job.query.QueryJob"] = (
+            # In google-cloud-bigquery 3.15.0, the _query_job attribute was
+            # made public and renamed to query_job.
+            cursor.query_job
+            if hasattr(cursor, "query_job")
+            else cursor._query_job  # type: ignore[attr-defined]
+        )
         assert query_job
         temp_destination_table = query_job.destination
         bigquery_temp_table = f"{temp_destination_table.project}.{temp_destination_table.dataset_id}.{temp_destination_table.table_id}"
         return bigquery_temp_table
     finally:
         raw_connection.close()
+
+
+def _get_columns_to_ignore_sampling(
+    dataset_name: str, tags_to_ignore: Optional[List[str]], platform: str, env: str
+) -> Tuple[bool, List[str]]:
+    logger.debug("Collecting columns to ignore for sampling")
+
+    ignore_table: bool = False
+    columns_to_ignore: List[str] = []
+
+    if not tags_to_ignore:
+        return ignore_table, columns_to_ignore
+
+    dataset_urn = mce_builder.make_dataset_urn(
+        name=dataset_name, platform=platform, env=env
+    )
+
+    datahub_graph = get_default_graph()
+
+    dataset_tags = datahub_graph.get_tags(dataset_urn)
+    if dataset_tags:
+        ignore_table = any(
+            tag_association.tag.split("urn:li:tag:")[1] in tags_to_ignore
+            for tag_association in dataset_tags.tags
+        )
+
+    if not ignore_table:
+        metadata = datahub_graph.get_aspect(
+            entity_urn=dataset_urn, aspect_type=EditableSchemaMetadata
+        )
+
+        if metadata:
+            for schemaField in metadata.editableSchemaFieldInfo:
+                if schemaField.globalTags:
+                    columns_to_ignore.extend(
+                        schemaField.fieldPath
+                        for tag_association in schemaField.globalTags.tags
+                        if tag_association.tag.split("urn:li:tag:")[1] in tags_to_ignore
+                    )
+
+    return ignore_table, columns_to_ignore

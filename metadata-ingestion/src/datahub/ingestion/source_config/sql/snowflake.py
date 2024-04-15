@@ -59,7 +59,7 @@ class BaseSnowflakeConfig(ConfigModel):
     )
     private_key: Optional[str] = pydantic.Field(
         default=None,
-        description="Private key in a form of '-----BEGIN PRIVATE KEY-----\\nprivate-key\\n-----END PRIVATE KEY-----\\n' if using key pair authentication. Encrypted version of private key will be in a form of '-----BEGIN ENCRYPTED PRIVATE KEY-----\\nencrypted-private-key\\n-----END ECNCRYPTED PRIVATE KEY-----\\n' See: https://docs.snowflake.com/en/user-guide/key-pair-auth.html",
+        description="Private key in a form of '-----BEGIN PRIVATE KEY-----\\nprivate-key\\n-----END PRIVATE KEY-----\\n' if using key pair authentication. Encrypted version of private key will be in a form of '-----BEGIN ENCRYPTED PRIVATE KEY-----\\nencrypted-private-key\\n-----END ENCRYPTED PRIVATE KEY-----\\n' See: https://docs.snowflake.com/en/user-guide/key-pair-auth.html",
     )
 
     private_key_path: Optional[str] = pydantic.Field(
@@ -107,7 +107,7 @@ class BaseSnowflakeConfig(ConfigModel):
         return account_id
 
     @pydantic.validator("authentication_type", always=True)
-    def authenticator_type_is_valid(cls, v, values, field):
+    def authenticator_type_is_valid(cls, v, values):
         if v not in VALID_AUTH_TYPES.keys():
             raise ValueError(
                 f"unsupported authenticator type '{v}' was provided,"
@@ -143,7 +143,7 @@ class BaseSnowflakeConfig(ConfigModel):
                 "'oauth_config' is none but should be set when using OAUTH_AUTHENTICATOR authentication"
             )
         if oauth_config.use_certificate is True:
-            if oauth_config.provider == OAuthIdentityProvider.OKTA.value:
+            if oauth_config.provider == OAuthIdentityProvider.OKTA:
                 raise ValueError(
                     "Certificate authentication is not supported for Okta."
                 )

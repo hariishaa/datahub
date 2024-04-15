@@ -8,8 +8,12 @@ from pydantic import Field, validator
 from typing_extensions import ClassVar
 
 from datahub.configuration import ConfigModel
-from datahub.configuration.common import AllowDenyPattern, ConfigurationError
-from datahub.configuration.source_common import DatasetSourceConfigMixin, EnvConfigMixin
+from datahub.configuration.common import AllowDenyPattern
+from datahub.configuration.source_common import (
+    EnvConfigMixin,
+    PlatformInstanceConfigMixin,
+)
+from datahub.configuration.validate_field_deprecation import pydantic_field_deprecated
 from datahub.configuration.validate_field_removal import pydantic_removed_field
 from datahub.ingestion.source.looker.looker_lib_wrapper import LookerAPIConfig
 from datahub.ingestion.source.state.stale_entity_removal_handler import (
@@ -56,11 +60,11 @@ class NamingPattern(ConfigModel):
 
         for v in variables:
             if v not in self.ALLOWED_VARS:
-                raise ConfigurationError(
+                raise ValueError(
                     f"Failed to find {v} in allowed_variables {self.ALLOWED_VARS}"
                 )
         if at_least_one and len(variables) == 0:
-            raise ConfigurationError(
+            raise ValueError(
                 f"Failed to find any variable assigned to pattern {self.pattern}. Must have at least one. {self.allowed_docstring()}"
             )
         return True
@@ -86,6 +90,7 @@ class NamingPatternMapping:
 @dataclasses.dataclass
 class ViewNamingPatternMapping(NamingPatternMapping):
     file_path: str
+    folder_path: str
 
 
 class LookerNamingPattern(NamingPattern):
@@ -98,23 +103,30 @@ class LookerViewNamingPattern(NamingPattern):
     ]
 
 
-class LookerCommonConfig(DatasetSourceConfigMixin):
+# TODO: deprecate browse_pattern configs
+class LookerCommonConfig(EnvConfigMixin, PlatformInstanceConfigMixin):
     explore_naming_pattern: LookerNamingPattern = pydantic.Field(
         description=f"Pattern for providing dataset names to explores. {LookerNamingPattern.allowed_docstring()}",
         default=LookerNamingPattern(pattern="{model}.explore.{name}"),
     )
     explore_browse_pattern: LookerNamingPattern = pydantic.Field(
         description=f"Pattern for providing browse paths to explores. {LookerNamingPattern.allowed_docstring()}",
-        default=LookerNamingPattern(pattern="/{env}/{platform}/{project}/explores"),
+        default=LookerNamingPattern(pattern="/Explore/{model}"),
     )
     view_naming_pattern: LookerViewNamingPattern = Field(
         LookerViewNamingPattern(pattern="{project}.view.{name}"),
         description=f"Pattern for providing dataset names to views. {LookerViewNamingPattern.allowed_docstring()}",
     )
     view_browse_pattern: LookerViewNamingPattern = Field(
-        LookerViewNamingPattern(pattern="/{env}/{platform}/{project}/views"),
+        LookerViewNamingPattern(pattern="/Develop/{project}/{folder_path}"),
         description=f"Pattern for providing browse paths to views. {LookerViewNamingPattern.allowed_docstring()}",
     )
+
+    _deprecate_explore_browse_pattern = pydantic_field_deprecated(
+        "explore_browse_pattern"
+    )
+    _deprecate_view_browse_pattern = pydantic_field_deprecated("view_browse_pattern")
+
     tag_measures_and_dimensions: bool = Field(
         True,
         description="When enabled, attaches tags to measures, dimensions and dimension groups to make them more "
@@ -156,11 +168,6 @@ class LookerDashboardSourceConfig(
         True,
         description="When enabled, extracts ownership from Looker directly. When disabled, ownership is left empty "
         "for dashboards and charts.",
-    )
-    actor: Optional[str] = Field(
-        None,
-        description="This config is deprecated in favor of `extract_owners`. Previously, was the actor to use in "
-        "ownership properties of ingested metadata.",
     )
     strip_user_ids_from_email: bool = Field(
         False,

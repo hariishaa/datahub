@@ -3,9 +3,20 @@ import pathlib
 import pytest
 
 from datahub.testing.check_sql_parser_result import assert_sql_result
-from datahub.utilities.sqlglot_lineage import _UPDATE_ARGS_NOT_SUPPORTED_BY_SELECT
 
 RESOURCE_DIR = pathlib.Path(__file__).parent / "goldens"
+
+
+def test_invalid_sql():
+    assert_sql_result(
+        """
+SELECT as '
+FROM snowflake_sample_data.tpch_sf1.orders o
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_invalid_sql.json",
+        allow_table_error=True,
+    )
 
 
 def test_select_max():
@@ -34,8 +45,7 @@ FROM mytable
                 "col2": "NUMBER",
             },
         },
-        # Shared with the test above.
-        expected_file=RESOURCE_DIR / "test_select_max.json",
+        expected_file=RESOURCE_DIR / "test_select_max_with_schema.json",
     )
 
 
@@ -132,6 +142,16 @@ limit 100;
 """,
         dialect="hive",
         expected_file=RESOURCE_DIR / "test_insert_as_select.json",
+    )
+
+
+def test_insert_with_column_list():
+    assert_sql_result(
+        """\
+insert into downstream (a, c) select a, c from upstream2
+""",
+        dialect="redshift",
+        expected_file=RESOURCE_DIR / "test_insert_with_column_list.json",
     )
 
 
@@ -509,6 +529,23 @@ FROM `bq-proj.dataset.table_2023*`
     )
 
 
+def test_bigquery_partitioned_table_insert():
+    assert_sql_result(
+        """
+SELECT *
+FROM `bq-proj.dataset.my-table$__UNPARTITIONED__`
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,bq-proj.dataset.my-table,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_partitioned_table_insert.json",
+    )
+
+
 def test_bigquery_star_with_replace():
     assert_sql_result(
         """
@@ -630,6 +667,84 @@ LIMIT 10
     )
 
 
+def test_snowflake_unused_cte():
+    # For this, we expect table level lineage to include table1, but CLL should not.
+    assert_sql_result(
+        """
+WITH cte1 AS (
+    SELECT col1, col2
+    FROM table1
+    WHERE col1 = 'value1'
+), cte2 AS (
+    SELECT col3, col4
+    FROM table2
+    WHERE col2 = 'value2'
+)
+SELECT cte1.col1, table3.col6
+FROM cte1
+JOIN table3 ON table3.col5 = cte1.col2
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_snowflake_unused_cte.json",
+    )
+
+
+def test_snowflake_cte_name_collision():
+    # In this example, output col1 should come from table3 and not table1, since the cte is unused.
+    # We'll still generate table-level lineage that includes table1.
+    assert_sql_result(
+        """
+WITH cte_alias AS (
+    SELECT col1, col2
+    FROM table1
+)
+SELECT table2.col2, cte_alias.col1
+FROM table2
+JOIN table3 AS cte_alias ON cte_alias.col2 = cte_alias.col2
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table1,PROD)": {
+                "col1": "NUMBER(38,0)",
+                "col2": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table2,PROD)": {
+                "col2": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table3,PROD)": {
+                "col1": "VARCHAR(16777216)",
+                "col2": "VARCHAR(16777216)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_cte_name_collision.json",
+    )
+
+
+def test_snowflake_full_table_name_col_reference():
+    assert_sql_result(
+        """
+SELECT
+    my_db.my_schema.my_table.id,
+    case when my_db.my_schema.my_table.id > 100 then 1 else 0 end as id_gt_100,
+    my_db.my_schema.my_table.struct_field.field1 as struct_field1,
+FROM my_db.my_schema.my_table
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_db.my_schema.my_table,PROD)": {
+                "id": "NUMBER(38,0)",
+                "struct_field": "struct",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_full_table_name_col_reference.json",
+    )
+
+
 # TODO: Add a test for setting platform_instance or env
 
 
@@ -722,10 +837,6 @@ WHERE orderkey = 3
         },
         expected_file=RESOURCE_DIR / "test_snowflake_update_hardcoded.json",
     )
-
-
-def test_update_from_select():
-    assert _UPDATE_ARGS_NOT_SUPPORTED_BY_SELECT == {"returning", "this"}
 
 
 def test_snowflake_update_from_table():
@@ -896,4 +1007,104 @@ UPDATE accounts SET (contact_first_name, contact_last_name) =
             },
         },
         expected_file=RESOURCE_DIR / "test_postgres_complex_update.json",
+    )
+
+
+def test_redshift_materialized_view_auto_refresh():
+    # Example query from the redshift docs: https://docs.aws.amazon.com/prescriptive-guidance/latest/materialized-views-redshift/refreshing-materialized-views.html
+    assert_sql_result(
+        """
+CREATE MATERIALIZED VIEW mv_total_orders
+AUTO REFRESH YES -- Add this clause to auto refresh the MV
+AS
+ SELECT c.cust_id,
+        c.first_name,
+        sum(o.amount) as total_amount
+ FROM orders o
+ JOIN customer c
+    ON c.cust_id = o.customer_id
+ GROUP BY c.cust_id,
+          c.first_name;
+""",
+        dialect="redshift",
+        expected_file=RESOURCE_DIR
+        / "test_redshift_materialized_view_auto_refresh.json",
+    )
+
+
+def test_redshift_temp_table_shortcut():
+    # On redshift, tables starting with # are temporary tables.
+    assert_sql_result(
+        """
+CREATE TABLE #my_custom_name
+distkey (1)
+sortkey (1,2)
+AS
+WITH cte AS (
+SELECT *
+FROM other_schema.table1
+)
+SELECT * FROM cte
+""",
+        dialect="redshift",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:redshift,my_db.other_schema.table1,PROD)": {
+                "col1": "INTEGER",
+                "col2": "INTEGER",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_redshift_temp_table_shortcut.json",
+    )
+
+
+def test_redshift_union_view():
+    # TODO: This currently fails to generate CLL. Need to debug further.
+    assert_sql_result(
+        """
+CREATE VIEW sales_vw AS SELECT * FROM public.sales UNION ALL SELECT * FROM spectrum.sales WITH NO SCHEMA BINDING
+""",
+        dialect="redshift",
+        default_db="my_db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:redshift,my_db.public.sales,PROD)": {
+                "col1": "INTEGER",
+                "col2": "INTEGER",
+            },
+            # Testing a case where we only have one schema available.
+        },
+        expected_file=RESOURCE_DIR / "test_redshift_union_view.json",
+    )
+
+
+@pytest.mark.skip(reason="sqlglot doesn't recognize the BACKUP directive right now")
+def test_redshift_system_automove() -> None:
+    # Came across this in the Redshift query log, but it seems to be a system-generated query.
+    assert_sql_result(
+        """
+CREATE TABLE "pg_automv"."mv_tbl__auto_mv_12708107__0_recomputed"
+BACKUP YES
+DISTSTYLE KEY
+DISTKEY(2)
+AS (
+    SELECT
+        COUNT(CAST(1 AS INT4)) AS "aggvar_3",
+        COUNT(CAST(1 AS INT4)) AS "num_rec"
+    FROM
+        "public"."permanent_1" AS "permanent_1"
+    WHERE (
+        (CAST("permanent_1"."insertxid" AS INT8) <= 41990135)
+        AND (CAST("permanent_1"."deletexid" AS INT8) > 41990135)
+    )
+    OR (
+        CAST(FALSE AS BOOL)
+        AND (CAST("permanent_1"."insertxid" AS INT8) = 0)
+        AND (CAST("permanent_1"."deletexid" AS INT8) <> 0)
+    )
+)
+""",
+        dialect="redshift",
+        default_db="my_db",
+        expected_file=RESOURCE_DIR / "test_redshift_system_automove.json",
     )
