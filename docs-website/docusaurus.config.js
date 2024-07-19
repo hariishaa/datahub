@@ -19,6 +19,11 @@ module.exports = {
       async: true,
       defer: true,
     },
+    {
+      src: "/scripts/rb2b.js",
+      async: true,
+      defer: true,
+    }
   ],
   noIndex: isSaas,
   customFields: {
@@ -66,9 +71,15 @@ module.exports = {
       },
       items: [
         {
-          to: "docs/features",
+          to: "docs/",
           activeBasePath: "docs",
           label: "Docs",
+          position: "right",
+        },
+        {
+          to: "/learn",
+          activeBasePath: "learn",
+          label: "Learn",
           position: "right",
         },
         {
@@ -98,6 +109,10 @@ module.exports = {
               to: "/champions",
               label: "Champions",
             },
+            {
+              label: "Share Your Journey",
+              href: "/customer-stories-survey",
+            },
           ],
         },
         {
@@ -110,7 +125,7 @@ module.exports = {
               label: "Demo",
             },
             {
-              href: "https://www.acryldata.io/blog",
+              href: "https://blog.datahubproject.io/",
               label: "Blog",
             },
             {
@@ -150,6 +165,22 @@ module.exports = {
                 },
                 {
                 value: `
+                   <a class="dropdown__link" href="https://docs-website-lzxh86531-acryldata.vercel.app/docs/features">0.13.0
+                   <svg width="12" height="12" aria-hidden="true" viewBox="0 0 24 24"><path fill="currentColor" d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"></path></svg>
+                   </a>
+                   `,
+                type: "html",
+                },
+                {
+                value: `
+                   <a class="dropdown__link" href="https://docs-website-2uuxmgza2-acryldata.vercel.app/docs/features">0.12.1
+                   <svg width="12" height="12" aria-hidden="true" viewBox="0 0 24 24"><path fill="currentColor" d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"></path></svg>
+                   </a>
+                   `,
+                type: "html",
+                },
+                {
+                value: `
                    <a class="dropdown__link" href="https://docs-website-irpoe2osc-acryldata.vercel.app/docs/features">0.11.0
                    <svg width="12" height="12" aria-hidden="true" viewBox="0 0 24 24"><path fill="currentColor" d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"></path></svg>
                    </a>
@@ -181,10 +212,6 @@ module.exports = {
             {
               label: "Quickstart",
               to: "docs/quickstart",
-            },
-            {
-              label: "Features",
-              to: "docs/features",
             },
           ],
         },
@@ -261,6 +288,13 @@ module.exports = {
       "@docusaurus/preset-classic",
       {
         docs: {
+            lastVersion: "current",
+              versions: {
+                current: {
+                  label: "Next",
+                  banner: 'none',
+                },
+              },
           path: "genDocs",
           sidebarPath: require.resolve("./sidebars.js"),
           ...(!isSaas && {
@@ -271,7 +305,15 @@ module.exports = {
           showLastUpdateAuthor: false,
           showLastUpdateTime: false,
         },
-        blog: false,
+        blog: {
+          blogTitle: "DataHub Learn",
+          blogSidebarTitle: "DataHub Learn",
+          blogDescription: "Learn about the hot topics in the data ecosystem and how DataHub can help you with your data journey.",
+          path: "src/learn",
+          routeBasePath: "learn",
+          postsPerPage: "ALL",
+          blogListComponent: "../src/learn/_components/LearnListPage",
+        },
         theme: {
           customCss: [
             isSaas ? require.resolve("./src/styles/acryl.scss") : require.resolve("./src/styles/datahub.scss"),
@@ -291,6 +333,23 @@ module.exports = {
     ],
   ],
   plugins: [
+    [
+      '@docusaurus/plugin-client-redirects',
+      {
+        createRedirects(existingPath) {
+          if (existingPath.includes('/docs')) {
+            return [
+              existingPath.replace('/docs', '/docs/next'),
+              existingPath.replace('/docs', '/docs/0.13.0'),
+              existingPath.replace('/docs', '/docs/0.12.1'),
+              existingPath.replace('/docs', '/docs/0.11.0'),
+              existingPath.replace('/docs', '/docs/0.10.5'),
+            ];
+          }
+          return undefined; // Return a falsy value: no redirect created
+        },
+      },
+    ],
     ["@docusaurus/plugin-ideal-image", { quality: 100, sizes: [320, 640, 1280, 1440, 1600] }],
     "docusaurus-plugin-sass",
     [

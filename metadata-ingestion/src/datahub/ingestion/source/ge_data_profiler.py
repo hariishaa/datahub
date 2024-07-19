@@ -142,11 +142,17 @@ class GEProfilerRequest:
     batch_kwargs: dict
 
 
-def get_column_unique_count_patch(self: SqlAlchemyDataset, column: str) -> int:
+def get_column_unique_count_dh_patch(self: SqlAlchemyDataset, column: str) -> int:
     if self.engine.dialect.name.lower() == REDSHIFT:
         element_values = self.engine.execute(
             sa.select(
-                [sa.text(f'APPROXIMATE count(distinct "{column}")')]  # type:ignore
+                [
+                    # We use coalesce here to force SQL Alchemy to see this
+                    # as a column expression.
+                    sa.func.coalesce(
+                        sa.text(f'APPROXIMATE count(distinct "{column}")')
+                    ),
+                ]
             ).select_from(self._table)
         )
         return convert_to_json_serializable(element_values.fetchone()[0])
@@ -154,9 +160,7 @@ def get_column_unique_count_patch(self: SqlAlchemyDataset, column: str) -> int:
         element_values = self.engine.execute(
             sa.select(
                 [
-                    sa.text(  # type:ignore
-                        f"APPROX_COUNT_DISTINCT(`{column}`)"
-                    )
+                    sa.func.coalesce(sa.text(f"APPROX_COUNT_DISTINCT(`{column}`)")),
                 ]
             ).select_from(self._table)
         )
@@ -233,9 +237,16 @@ def _is_single_row_query_method(query: Any) -> bool:
         "unexpected_count",
     ]
 
+    FIRST_PARTY_SINGLE_ROW_QUERY_METHODS = {
+        "get_column_unique_count_dh_patch",
+    }
+
     # We'll do this the inefficient way since the arrays are pretty small.
     stack = traceback.extract_stack()
     for frame in reversed(stack):
+        if frame.name in FIRST_PARTY_SINGLE_ROW_QUERY_METHODS:
+            return True
+
         if not any(frame.filename.endswith(file) for file in SINGLE_ROW_QUERY_FILES):
             continue
 
@@ -689,8 +700,27 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
         logger.debug(f"profiling {self.dataset_name}: flushing stage 1 queries")
         self.query_combiner.flush()
 
+        assert profile.rowCount is not None
+        full_row_count = profile.rowCount
+
         if self.config.use_sampling and not self.config.limit:
             self.update_dataset_batch_use_sampling(profile)
+
+        # Note that this row count may be different from the full_row_count if we are using sampling.
+        row_count: int = profile.rowCount
+        if profile.partitionSpec and "SAMPLE" in profile.partitionSpec.partition:
+            # Querying exact row count of sample using `_get_dataset_rows`.
+            # We are not using `self.config.sample_size` directly as the actual row count
+            # in the sample may be different than configured `sample_size`. For BigQuery,
+            # we've even seen 160k rows returned for a sample size of 10k.
+            logger.debug("Recomputing row count for the sample")
+
+            # Note that we can't just call `self._get_dataset_rows(profile)` here because
+            # there's some sort of caching happening that will return the full table row count
+            # instead of the sample row count.
+            row_count = self.dataset.get_row_count(str(self.dataset._table))
+
+            profile.partitionSpec.partition += f" (sample rows {row_count})"
 
         columns_profiling_queue: List[_SingleColumnSpec] = []
         if columns_to_profile:
@@ -707,16 +737,6 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
 
         logger.debug(f"profiling {self.dataset_name}: flushing stage 2 queries")
         self.query_combiner.flush()
-
-        assert profile.rowCount is not None
-        row_count: int  # used for null counts calculation
-        if profile.partitionSpec and "SAMPLE" in profile.partitionSpec.partition:
-            # Querying exact row count of sample using `_get_dataset_rows`.
-            # We are not using `self.config.sample_size` directly as actual row count
-            # in sample may be slightly different (more or less) than configured `sample_size`.
-            self._get_dataset_rows(profile)
-
-        row_count = profile.rowCount
 
         for column_spec in columns_profiling_queue:
             column = column_spec.column
@@ -825,6 +845,10 @@ class _SingleDatasetProfiler(BasicDatasetProfilerBase):
 
         logger.debug(f"profiling {self.dataset_name}: flushing stage 3 queries")
         self.query_combiner.flush()
+
+        # Reset the row count to the original value.
+        profile.rowCount = full_row_count
+
         return profile
 
     def init_profile(self):
@@ -1010,7 +1034,7 @@ class DatahubGEProfiler:
 
         with PerfTimer() as timer, unittest.mock.patch(
             "great_expectations.dataset.sqlalchemy_dataset.SqlAlchemyDataset.get_column_unique_count",
-            get_column_unique_count_patch,
+            get_column_unique_count_dh_patch,
         ), unittest.mock.patch(
             "great_expectations.dataset.sqlalchemy_dataset.SqlAlchemyDataset._get_column_quantiles_bigquery",
             _get_column_quantiles_bigquery_patch,
@@ -1156,6 +1180,7 @@ class DatahubGEProfiler:
             if custom_sql is not None:
                 ge_config["query"] = custom_sql
 
+        batch = None
         with self._ge_context() as ge_context, PerfTimer() as timer:
             try:
                 logger.info(f"Profiling {pretty_name}")
@@ -1191,11 +1216,25 @@ class DatahubGEProfiler:
             except Exception as e:
                 if not self.config.catch_exceptions:
                     raise e
-                logger.exception(f"Encountered exception while profiling {pretty_name}")
-                self.report.report_warning(pretty_name, f"Profiling exception {e}")
+
+                error_message = str(e).lower()
+                if "permission denied" in error_message:
+                    self.report.warning(
+                        title="Unauthorized to extract data profile statistics",
+                        message="We were denied access while attempting to generate profiling statistics for some assets. Please ensure the provided user has permission to query these tables and views.",
+                        context=f"Asset: {pretty_name}",
+                        exc=e,
+                    )
+                else:
+                    self.report.warning(
+                        title="Failed to extract statistics for some assets",
+                        message="Caught unexpected exception while attempting to extract profiling statistics for some assets.",
+                        context=f"Asset: {pretty_name}",
+                        exc=e,
+                    )
                 return None
             finally:
-                if self.base_engine.engine.name == TRINO:
+                if batch is not None and self.base_engine.engine.name == TRINO:
                     self._drop_trino_temp_table(batch)
 
     def _get_ge_dataset(
@@ -1274,6 +1313,7 @@ def create_bigquery_temp_table(
     try:
         cursor: "BigQueryCursor" = cast("BigQueryCursor", raw_connection.cursor())
         try:
+            logger.debug(f"Creating temporary table for {table_pretty_name}: {bq_sql}")
             cursor.execute(bq_sql)
         except Exception as e:
             if not instance.config.catch_exceptions:
