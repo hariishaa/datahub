@@ -270,7 +270,7 @@ public class DatahubSparkListener extends SparkListener {
     long startTime = System.currentTimeMillis();
     initializeContextFactoryIfNotInitialized();
 
-    log.debug("Application end called");
+    log.info("Application end called");
     listener.onApplicationEnd(applicationEnd);
     if (datahubConf.hasPath(STREAMING_JOB) && (datahubConf.getBoolean(STREAMING_JOB))) {
       return;
@@ -282,7 +282,7 @@ public class DatahubSparkListener extends SparkListener {
     }
 
     long elapsedTime = System.currentTimeMillis() - startTime;
-    log.debug("onApplicationEnd completed successfully in {} ms", elapsedTime);
+    log.info("onApplicationEnd completed successfully in {} ms", elapsedTime);
   }
 
   public void onTaskEnd(SparkListenerTaskEnd taskEnd) {
@@ -359,9 +359,9 @@ public class DatahubSparkListener extends SparkListener {
         throw new RuntimeException(e);
       }
       log.debug("Query progress event: {}", queryProgressEvent.progress());
-      long elapsedTime = System.currentTimeMillis() - startTime;
-      log.debug("onOtherEvent completed successfully in {} ms", elapsedTime);
     }
+    long elapsedTime = System.currentTimeMillis() - startTime;
+    log.debug("onOtherEvent completed successfully in {} ms", elapsedTime);
   }
 
   private static void initializeMetrics(OpenLineageConfig openLineageConfig) {
