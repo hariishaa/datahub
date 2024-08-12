@@ -10,8 +10,7 @@ public enum HdfsPlatform {
   ABFS(Arrays.asList("abfs", "abfss"), "abfs"),
   DBFS(Collections.singletonList("dbfs"), "dbfs"),
   FILE(Collections.singletonList("file"), "file"),
-  // default platform
-  HDFS(Collections.emptyList(), "hdfs");
+  HDFS(Collections.singletonList("hdfs"), "hdfs");
 
   public final List<String> prefixes;
   public final String platform;
